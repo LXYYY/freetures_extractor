@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<launch>
+  <node pkg="freetures_extractor" type="freetures_extractor_node.py" name="freetures_extractor_node">
+    
+  </node>
+</launch>

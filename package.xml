@@ -1,0 +1,22 @@
+<?xml version="2.0"?>
+<package format="2">
+  <name>freetures_extractor</name>
+  <version>0.0.1</version>
+  <description>Python implementation of freestures</description>
+
+  <maintainer email="xiangyu002@e.ntu.edu.sg">Mike Xiangyu Liu</maintainer>
+
+  <license>BSD 2-Clause</license>
+
+  <author email="xiangyu002@e.ntu.edu.sg">Mike Xiangyu Liu</author>
+  <author>Mike Xiangyu Liu</author>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend>catkin_simple</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>message_runtime</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>voxblox_ros</depend>
+</package>
