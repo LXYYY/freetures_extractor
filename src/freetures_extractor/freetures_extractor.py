@@ -4,7 +4,6 @@ import Queue
 import numpy as np
 import tensorflow as tf
 import pcl
-from pcl import pcl_visulization
 
 
 class FreeturesExtractor(object):
@@ -21,9 +20,7 @@ class FreeturesExtractor(object):
             for subwords in ['x', 'y', 'z', 'dist']:
                 f.write("{}\n".format(subwords))
 
-        if param['pcl_vis']:
-            self.pcl_vis = pcl_visulization.PCLVisualizering()
-        self.r_frame = param['r_f']
+        self.r_frame = param['r_frame']
 
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
@@ -72,7 +69,7 @@ class FreeturesExtractor(object):
             x_grad_gauss, y_grad_gauss, z_grad_gauss = self._get_gaussian(
                 2)  # sigma_grad
             x_desc_gauss, y_desc_gauss, z_desc_gauss = self._get_gaussian(
-                self.param['rf'])  # sigma_grad
+                self.param['r_frame'])  # sigma_grad
 
             # compute det of hessian
             pc_in = tf.placeholder(dtype=tf.float32)
@@ -140,12 +137,15 @@ class FreeturesExtractor(object):
             ],
                                          strides=1,
                                          padding='SAME')
-            non_zeros = tf.math.not_equal(local_max, tf.constant(0.0))
-            non_zeros = -tf.nn.max_pool3d(
-                -non_zeros,
-                [self.param['rf'], self.param['rf'], self.param['rf']],
-                strides=1,
-                padding='SAME')
+            non_zeros = tf.cast(tf.math.not_equal(local_max, tf.constant(0.0)),
+                                tf.float32)
+            non_zeros = tf.cast(
+                -tf.nn.max_pool3d(-non_zeros, [
+                    self.param['r_frame'], self.param['r_frame'],
+                    self.param['r_frame']
+                ],
+                                  strides=1,
+                                  padding='SAME'), tf.bool)
             kp = tf.math.logical_and(tf.math.equal(det, local_max), non_zeros)
             n_kp = tf.reduce_sum(tf.cast(kp, dtype=tf.float32))
 
@@ -157,7 +157,7 @@ class FreeturesExtractor(object):
                                  y_desc_gauss, z_desc_gauss)
             gyx = self._gaussian(tf.math.multiply(gy, gx), x_desc_gauss,
                                  y_desc_gauss, z_desc_gauss)
-            gyy = self._gaussian(tf.math.square(gy, gy), x_desc_gauss,
+            gyy = self._gaussian(tf.math.square(gy), x_desc_gauss,
                                  y_desc_gauss, z_desc_gauss)
             gyz = self._gaussian(tf.math.multiply(gy, gz), x_desc_gauss,
                                  y_desc_gauss, z_desc_gauss)
@@ -165,7 +165,7 @@ class FreeturesExtractor(object):
                                  y_desc_gauss, z_desc_gauss)
             gzy = self._gaussian(tf.math.multiply(gz, gy), x_desc_gauss,
                                  y_desc_gauss, z_desc_gauss)
-            gzz = self._gaussian(tf.math.square(gz, gz), x_desc_gauss,
+            gzz = self._gaussian(tf.math.square(gz), x_desc_gauss,
                                  y_desc_gauss, z_desc_gauss)
             s_row1 = tf.squeeze(tf.stack([gxx, gxy, gxz], axis=4), axis=5)
             s_row2 = tf.squeeze(tf.stack([gyx, gyy, gyz], axis=4), axis=5)
@@ -177,22 +177,22 @@ class FreeturesExtractor(object):
 
             with self.session.as_default():
                 while True:
-                    print 'processed esdf point cloud size'
                     pc_in_numpy = self.esdf_queue.get(True)
+                    print 'processed esdf point cloud size'
                     print np.multiply.accumulate(pc_in_numpy.shape)
-                    print self.session.run([n_kp, s_omega],
-                                           feed_dict={pc_in: pc_in_numpy})
+                    self.session.run([n_kp, s_omega],
+                                     feed_dict={pc_in: pc_in_numpy})
+                    print np.array(n_kp)
 
-                    det_np = np.array(det)
-                    kp_np = np.array(kp)
-                    if self.param['pcl_vis']:
-                        self._visualize_pcl(pc_in_numpy, det_np, kp_np)
+                    # det_np = np.array(det)
+                    # kp_np = np.array(kp)
 
     def _compute_lrf(self, s_omega, g, kp):  # np.array [i,j,k,c]
         kp_id = np.where(kp == 1)
         for kp_id in kp_id:
             _, kp_v = np.linalg.eig(s_omega[kp_id])
             for i in range(3):
+                # Equation 8
                 s = np.sum(
                     np.dot(
                         g[kp_id[0] - self.r_frame:kp_id[0] +
