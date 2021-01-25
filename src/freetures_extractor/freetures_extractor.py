@@ -7,6 +7,7 @@ import numpy as np
 from std_msgs.msg import Header
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import PointCloud2, PointField
+from visualization_msgs.msg import Marker, MarkerArray
 import tensorflow as tf
 
 
@@ -24,9 +25,11 @@ class FreeturesExtractor(object):
             for subwords in ['x', 'y', 'z', 'dist']:
                 f.write("{}\n".format(subwords))
         self.r_frame = param['r_frame']
-        self.dist_pc_pub = rospy.Publisher("distance", PointCloud2)
-        self.det_pc_pub = rospy.Publisher("det", PointCloud2)
-        self.kp_pc_pub = rospy.Publisher("keypoints", PointCloud2)
+        self.vis_scale = param['vis_scale']
+        self.dist_pc_pub = rospy.Publisher('distance', PointCloud2)
+        self.det_pc_pub = rospy.Publisher('det', PointCloud2)
+        self.kp_pc_pub = rospy.Publisher('keypoints', PointCloud2)
+        self.lrf_pub = rospy.Publisher('lrc', MarkerArray)
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
         self.session = tf.Session(config=config)
@@ -188,9 +191,14 @@ class FreeturesExtractor(object):
                     det_np, kp_np, g_gauss_np, s_omega_np = self.session.run(
                         [det, kp, g_gauss, s_omega],
                         feed_dict={pc_in: pc_in_numpy})
-                    self._compute_lrf(s_omega_np[0, :, :, :, :, :],
-                                      g_gauss_np[0, :, :, :, :,
-                                                 0], kp_np[0, :, :, :, 0])
+
+                    kp_ids = np.where(kp_np[0, :, :, :, 0] == 1)
+                    lrf = self._compute_lrf(s_omega_np[0, :, :, :, :, :],
+                                            g_gauss_np[0, :, :, :, :,
+                                                       0], kp_ids)
+
+                    # rviz visualization
+                    self._publish_lrf_arrow(lrf, kp_ids)
                     self._publish_pointcloud(pc_in_numpy[0, :, :, :, :],
                                              self.dist_pc_pub, 'dist')
                     self._publish_pointcloud(det_np[0, :, :, :, :],
@@ -201,12 +209,11 @@ class FreeturesExtractor(object):
                     # det_np = np.array(det)
                     # kp_np = np.array(kp)
 
-    def _compute_lrf(self, s_omega, g, kp):  # np.array [i,j,k,c]
-        kp_ids = np.where(kp == 1)
-        shape = kp.shape
-        kp_a = np.empty(shape=(shape[0], shape[1], shape[2]) + (0, )).tolist()
+    def _compute_lrf(self, s_omega, g, kp_ids):  # np.array [i,j,k,c]
         if not kp_ids[0]:
             return
+        shape = g.shape
+        kp_a = np.empty(shape=(kp_ids[0].shape[0]) + (0, )).tolist()
         for i in range(len(kp_ids[0])):
             kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
             _, v = np.linalg.eig(s_omega[kp_id[0], kp_id[1], kp_id[2]])
@@ -239,7 +246,7 @@ class FreeturesExtractor(object):
                 else:
                     a.append(-v[j])
                     a.append(0)
-            kp_a[kp_id[0]][kp_id[1]][kp_id[2]] = a
+            kp_a[i] = a
         return kp_a
 
     def _publish_pointcloud(self, pc_np, publisher, data_type):
@@ -281,7 +288,11 @@ class FreeturesExtractor(object):
                 b = 0
             a = 255
             rgba = struct.unpack("I", struct.pack('BBBB', b, g, r, a))[0]
-            pt = [float(x * 0.1), float(y * 0.1), float(z * 0.1), rgba]
+            pt = [
+                float(x * self.vis_scale),
+                float(y * self.vis_scale),
+                float(z * self.vis_scale), rgba
+            ]
             points.append(pt)
         fields = [
             PointField('x', 0, PointField.FLOAT32, 1),
@@ -296,6 +307,45 @@ class FreeturesExtractor(object):
         publisher.publish(pc2)
         # pylint: disable=line-too-long
         print 'published point cloud %s size: ' % data_type, pc2.height * pc2.width
+
+    def __new_marker(self):
+        marker = Marker()
+        marker.header.stamp = rospy.Time.now()
+        marker.header.frame_id = 'world'
+        marker.ns = 'lrf'
+        marker.id = 0
+        marker.type = Marker.ARROW
+        # TODO(mikexyl): not sure
+        marker.action = Marker.ADD
+        return marker
+
+    def _publish_lrf_arrow(self, lrf, kp_ids):
+        reset_marker = self.__new_marker()
+        reset_marker.action = Marker.DELETEALL
+        self.lrf_pub.publish(reset_marker)
+        assert len(lrf) == len(kp_ids[0])
+        marker_array = MarkerArray()
+        for i in range(len(kp_ids)):
+            x = kp_ids[0][i] * self.vis_scale
+            y = kp_ids[1][i] * self.vis_scale
+            z = kp_ids[2][i] * self.vis_scale
+            a = np.zeros((2, 3))
+            for j in range(3):
+                for k in range(2):
+                    if lrf[i][j * 2 + k] > 0:
+                        a[k][j] = lrf[i][j * 2 + k]
+            assert (a[0, :] != 0).all()
+            marker = self.__new_marker()
+            marker.points.append(np.array([x, y, z]))
+            marker.points.append(np.array([x, y, z] + a[0, :]))
+            marker_array.markers.append(marker)
+            if (a[1, :] != 0).any():
+                for l in range(3):
+                    if (a[1, l] != 0):
+                        a[0, l] = a[1, l]
+                marker.points[1] = np.array([x, y, z] + a[0, :])
+                marker_array.markers.append(marker)
+        self.lrf_pub.publish(marker_array)
 
     def extractFreetures(self, pointcloud):
         i_max = np.max(pointcloud['gi'])
