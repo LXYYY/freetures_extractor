@@ -1,9 +1,13 @@
 import os
 import threading
+import struct
 import Queue
+import rospy
 import numpy as np
+from std_msgs.msg import Header
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import PointCloud2, PointField
 import tensorflow as tf
-import pcl
 
 
 class FreeturesExtractor(object):
@@ -19,9 +23,10 @@ class FreeturesExtractor(object):
         with open(self.pc_input_metadata, "w") as f:
             for subwords in ['x', 'y', 'z', 'dist']:
                 f.write("{}\n".format(subwords))
-
         self.r_frame = param['r_frame']
-
+        self.dist_pc_pub = rospy.Publisher("distance", PointCloud2)
+        self.det_pc_pub = rospy.Publisher("det", PointCloud2)
+        self.kp_pc_pub = rospy.Publisher("keypoints", PointCloud2)
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
         self.session = tf.Session(config=config)
@@ -137,7 +142,7 @@ class FreeturesExtractor(object):
             ],
                                          strides=1,
                                          padding='SAME')
-            non_zeros = tf.cast(tf.math.not_equal(local_max, tf.constant(0.0)),
+            non_zeros = tf.cast(tf.math.not_equal(pc_in, tf.constant(0.0)),
                                 tf.float32)
             non_zeros = tf.cast(
                 -tf.nn.max_pool3d(-non_zeros, [
@@ -147,26 +152,26 @@ class FreeturesExtractor(object):
                                   strides=1,
                                   padding='SAME'), tf.bool)
             kp = tf.math.logical_and(tf.math.equal(det, local_max), non_zeros)
-            n_kp = tf.reduce_sum(tf.cast(kp, dtype=tf.float32))
 
-            gxx = self._gaussian(tf.math.square(gx), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gxy = self._gaussian(tf.math.multiply(gx, gy), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gxz = self._gaussian(tf.math.multiply(gx, gz), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gyx = self._gaussian(tf.math.multiply(gy, gx), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gyy = self._gaussian(tf.math.square(gy), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gyz = self._gaussian(tf.math.multiply(gy, gz), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gzx = self._gaussian(tf.math.multiply(gz, gx), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gzy = self._gaussian(tf.math.multiply(gz, gy), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
-            gzz = self._gaussian(tf.math.square(gz), x_desc_gauss,
-                                 y_desc_gauss, z_desc_gauss)
+            gx_gauss = self._gaussian(gx, x_desc_gauss, y_desc_gauss,
+                                      z_desc_gauss)
+            gy_gauss = self._gaussian(gy, y_desc_gauss, y_desc_gauss,
+                                      z_desc_gauss)
+            gz_gauss = self._gaussian(gz, z_desc_gauss, y_desc_gauss,
+                                      z_desc_gauss)
+
+            g_gauss = tf.stack([gx_gauss, gy_gauss, gz_gauss], axis=4)
+
+            gxx = tf.math.square(gx_gauss)
+            gxy = tf.math.multiply(gx_gauss, gy_gauss)
+            gxz = tf.math.multiply(gx_gauss, gz_gauss)
+            gyx = tf.math.multiply(gy_gauss, gx_gauss)
+            gyy = tf.math.square(gy_gauss)
+            gyz = tf.math.multiply(gy_gauss, gz_gauss)
+            gzx = tf.math.multiply(gz_gauss, gx_gauss)
+            gzy = tf.math.multiply(gz_gauss, gy_gauss)
+            gzz = tf.math.square(gz_gauss)
+
             s_row1 = tf.squeeze(tf.stack([gxx, gxy, gxz], axis=4), axis=5)
             s_row2 = tf.squeeze(tf.stack([gyx, gyy, gyz], axis=4), axis=5)
             s_row3 = tf.squeeze(tf.stack([gzx, gzy, gzz], axis=4), axis=5)
@@ -180,35 +185,117 @@ class FreeturesExtractor(object):
                     pc_in_numpy = self.esdf_queue.get(True)
                     print 'processed esdf point cloud size'
                     print np.multiply.accumulate(pc_in_numpy.shape)
-                    self.session.run([n_kp, s_omega],
-                                     feed_dict={pc_in: pc_in_numpy})
-                    print np.array(n_kp)
+                    det_np, kp_np, g_gauss_np, s_omega_np = self.session.run(
+                        [det, kp, g_gauss, s_omega],
+                        feed_dict={pc_in: pc_in_numpy})
+                    self._compute_lrf(s_omega_np[0, :, :, :, :, :],
+                                      g_gauss_np[0, :, :, :, :,
+                                                 0], kp_np[0, :, :, :, 0])
+                    self._publish_pointcloud(pc_in_numpy[0, :, :, :, :],
+                                             self.dist_pc_pub, 'dist')
+                    self._publish_pointcloud(det_np[0, :, :, :, :],
+                                             self.det_pc_pub, 'det')
+                    self._publish_pointcloud(kp_np[0, :, :, :, :],
+                                             self.kp_pc_pub, 'kp')
 
                     # det_np = np.array(det)
                     # kp_np = np.array(kp)
 
     def _compute_lrf(self, s_omega, g, kp):  # np.array [i,j,k,c]
-        kp_id = np.where(kp == 1)
-        for kp_id in kp_id:
-            _, kp_v = np.linalg.eig(s_omega[kp_id])
-            for i in range(3):
+        kp_ids = np.where(kp == 1)
+        shape = kp.shape
+        kp_a = np.empty(shape=(shape[0], shape[1], shape[2]) + (0, )).tolist()
+        if not kp_ids[0]:
+            return
+        for i in range(len(kp_ids[0])):
+            kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
+            _, v = np.linalg.eig(s_omega[kp_id[0], kp_id[1], kp_id[2]])
+            a = []
+            for j in range(3):
                 # Equation 8
-                s = np.sum(
-                    np.dot(
-                        g[kp_id[0] - self.r_frame:kp_id[0] +
-                          self.r_frame, :kp_id[1] - self.r_frame:kp_id[1] +
-                          self.r_frame,
-                          kp_id[2] - self.r_frame:kp_id[2] + self.r_frame],
-                        kp_v[i]))
-                print s
+                i0 = kp_id[0] - self.r_frame
+                i1 = kp_id[0] + self.r_frame
+                j0 = kp_id[1] - self.r_frame
+                j1 = kp_id[1] + self.r_frame
+                k0 = kp_id[2] - self.r_frame
+                k1 = kp_id[2] + self.r_frame
+                if i0 < 0 or i1 > shape[0] or j0 < 0 or j1 > shape[
+                        1] or k0 < 0 or k1 > shape[2]:
+                    continue
+                gk = g[i0:i1, j0:j1, k0:k1]
+                # TODO(mikexyl): check dimension
+                gkvi = np.tensordot(gk, v[j], axes=(3, 0))
+                s = np.sum(gkvi)
+                s = s / np.sum(np.abs(gkvi))
 
-    def _visualize_pcl(self, in_np, det_np, kp_np):
-        in_pcl = pcl.PointCloud(in_np, dtype=np.float32)
-        det_pcl = pcl.PointCloud(det_np, dtype=np.float32)
-        kp_pcl = pcl.PointCloud(kp_np, dtype=np.float32)
-        print in_pcl
-        print det_pcl
-        print kp_pcl
+                # Equation 7
+                k_axis = self.param['k_axis']
+                if s >= k_axis:
+                    a.append(v[j])
+                    a.append(0)
+                elif -k_axis <= s <= k_axis:
+                    a.append(v[j])
+                    a.append(-v[j])
+                else:
+                    a.append(-v[j])
+                    a.append(0)
+            kp_a[kp_id[0]][kp_id[1]][kp_id[2]] = a
+        return kp_a
+
+    def _publish_pointcloud(self, pc_np, publisher, data_type):
+        assert len(pc_np.shape) == 4
+        points = []
+        pt_ids = np.where(pc_np != 0)
+        max_value = pc_np.max() - pc_np.min()
+        min_value = pc_np.min()
+        if not pt_ids:
+            return
+        for i in range(len(pt_ids[0])):
+            x = pt_ids[0][i]
+            y = pt_ids[1][i]
+            z = pt_ids[2][i]
+            if data_type == 'dist':
+                if pc_np[x, y, z][0] > 0:
+                    r = 0
+                    g = int(
+                        np.log((
+                            (pc_np[x, y, z][0] - min_value) / max_value) + 1) *
+                        255)
+                    b = 0
+                else:
+                    r = 0
+                    g = 0
+                    b = int(
+                        np.log((
+                            (pc_np[x, y, z][0] - min_value) / max_value) + 1) *
+                        255)
+            elif data_type == 'det':
+                r = 0
+                g = 0
+                b = int(
+                    np.log(((pc_np[x, y, z][0] - min_value) / max_value) + 1) *
+                    255)
+            elif data_type == 'kp':
+                r = 255
+                g = 0
+                b = 0
+            a = 255
+            rgba = struct.unpack("I", struct.pack('BBBB', b, g, r, a))[0]
+            pt = [float(x * 0.1), float(y * 0.1), float(z * 0.1), rgba]
+            points.append(pt)
+        fields = [
+            PointField('x', 0, PointField.FLOAT32, 1),
+            PointField('y', 4, PointField.FLOAT32, 1),
+            PointField('z', 8, PointField.FLOAT32, 1),
+            PointField('rgba', 12, PointField.UINT32, 1)
+        ]
+        header = Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = 'world'
+        pc2 = point_cloud2.create_cloud(header, fields, points)
+        publisher.publish(pc2)
+        # pylint: disable=line-too-long
+        print 'published point cloud %s size: ' % data_type, pc2.height * pc2.width
 
     def extractFreetures(self, pointcloud):
         i_max = np.max(pointcloud['gi'])
