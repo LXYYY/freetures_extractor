@@ -8,6 +8,7 @@ from std_msgs.msg import Header
 from sensor_msgs import point_cloud2
 from sensor_msgs.msg import PointCloud2, PointField
 from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
 import tensorflow as tf
 
 
@@ -30,6 +31,7 @@ class FreeturesExtractor(object):
         self.det_pc_pub = rospy.Publisher('det', PointCloud2)
         self.kp_pc_pub = rospy.Publisher('keypoints', PointCloud2)
         self.lrf_pub = rospy.Publisher('lrc', MarkerArray)
+        self.grad_pub = rospy.Publisher('gradient', MarkerArray)
         self.grad_gauss_sum = 0
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
@@ -183,15 +185,17 @@ class FreeturesExtractor(object):
             with self.session.as_default():
                 while True:
                     pc_in_numpy = self.esdf_queue.get(True)
-                    print 'processed esdf point cloud size'
-                    print np.multiply.accumulate(pc_in_numpy.shape)
+                    print('processed esdf point cloud size')
+                    print(np.multiply.accumulate(pc_in_numpy.shape))
                     det_np, kp_np, g_gauss_np, s_omega_np = self.session.run(
                         [det, kp, g_gauss, s_omega],
                         feed_dict={pc_in: pc_in_numpy})
 
                     kp_ids = np.where(kp_np[0, :, :, :, 0] == 1)
-                    self._compute_lrf(s_omega_np[0, :, :, :, :, :],
-                                      g_gauss_np[0, :, :, :, :, 0], kp_ids)
+                    s_omega_rdc = s_omega_np[0, :, :, :, :, :]
+                    g_gauss_rdc = g_gauss_np[0, :, :, :, :, 0]
+                    self._compute_lrf(s_omega_rdc, g_gauss_rdc, kp_ids)
+                    self._publish_gradient_arrow(g_gauss_rdc, kp_ids)
 
                     # rviz visualization
                     # self._publish_lrf_arrow(lrf, kp_ids)
@@ -219,10 +223,10 @@ class FreeturesExtractor(object):
         return g[i0:i1, j0:j1, k0:k1]
 
     def _compute_lrf(self, s_omega, g, kp_ids):  # np.array [i,j,k,c]
-        if not kp_ids[0]:
+        if len(kp_ids[0]):
             return
         shape = g.shape
-        kp_a = np.empty(shape=(kp_ids[0].shape[0]) + (0, )).tolist()
+        kp_a = np.zeros(shape=(kp_ids[0].shape[0], 6, 3))
         eigen_value = []
         for i in range(len(kp_ids[0])):
             kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
@@ -241,17 +245,14 @@ class FreeturesExtractor(object):
                 # Equation 7
                 k_axis = self.param['k_axis']
                 if s >= k_axis:
-                    a.append(v[j])
-                    a.append(np.array([0, 0, 0]))
+                    kp_a[i, j, :] = v[j]
+                    kp_a[i, j + 3, :] = v[j]
                 elif -k_axis <= s <= k_axis:
-                    a.append(v[j])
-                    a.append(-v[j])
+                    kp_a[i, j, :] = v[j]
+                    kp_a[i, j + 3, :] = -v[j]
                 else:
-                    a.append(-v[j])
-                    a.append(np.array([0, 0, 0]))
-            if len(a) != 6:
-                continue
-            kp_a[i] = a
+                    kp_a[i, j, :] = -v[j]
+                    kp_a[i, j + 3, :] = -v[j]
             eigen_value.append(e_val)
         return kp_a, eigen_value
 
@@ -340,17 +341,24 @@ class FreeturesExtractor(object):
         pc2 = point_cloud2.create_cloud(header, fields, points)
         publisher.publish(pc2)
         # pylint: disable=line-too-long
-        print 'published point cloud %s size: ' % data_type, pc2.height * pc2.width
+        print('published point cloud %s size: ' % data_type,
+              pc2.height * pc2.width)
 
-    def __new_marker(self):
+    def __new_marker(self, ns, id, frame_id, type, action):
         marker = Marker()
         marker.header.stamp = rospy.Time.now()
-        marker.header.frame_id = 'world'
-        marker.ns = 'lrf'
-        marker.id = 0
-        marker.type = Marker.ARROW
+        marker.header.frame_id = frame_id
+        marker.ns = ns
+        marker.id = id
+        marker.type = type
         # TODO(mikexyl): not sure
-        marker.action = Marker.ADD
+        marker.action = action
+        marker.scale.x = 0.01
+        marker.scale.y = 0.02
+        marker.color.r = 0
+        marker.color.g = 0
+        marker.color.b = 255
+        marker.color.a = 255
         return marker
 
     # def _publish_lrf_arrow(self, lrf, kp_ids):
@@ -371,19 +379,37 @@ class FreeturesExtractor(object):
     #             marker_array.markers.append(marker)
     #     self.lrf_pub.publish(marker_array)
 
+    def _publish_gradient_arrow(self, g, kp_ids):
+        if len(kp_ids[0]) == 0:
+            return
+        reset_marker = self.__new_marker('gradient', 0, 'world', Marker.ARROW,
+                                         Marker.DELETEALL)
+        reset_marker.action = Marker.DELETEALL
+        self.grad_pub.publish([reset_marker])
+        grad_markers = MarkerArray()
+        for i in range(len(kp_ids[0])):
+            kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
+            grad_marker = self.__new_marker('gradient', i, 'world',
+                                            Marker.ARROW, Marker.ADD)
+            x = kp_id[0] * self.vis_scale
+            y = kp_id[1] * self.vis_scale
+            z = kp_id[2] * self.vis_scale
+            grad_marker.points.append(Point(x=x, y=y, z=z))
+            gp = g[kp_id[0], kp_id[1], kp_id[2]]
+            grad_marker.points.append(
+                Point(x=x + gp[0], y=y + gp[1], z=z + gp[2]))
+            grad_markers.markers.append(grad_marker)
+        self.grad_pub.publish(grad_markers)
+
     def __compute_two_lrf(self, lrf):
         a = np.zeros((2, 3, 3))
         a_ls = []
-        for j in range(3):
-            for k in range(2):
-                if (lrf[j * 2 + k] != 0).any():
-                    a[k, j, :] = lrf[j * 2 + k]
-        a_ls.append(a[0, :, :])
-        for l in range(3):
-            if (a[1, l, :] != 0).any():
-                a[0, l, :] = a[1, l, :]
-        if a[0, :, :] != a_ls[0]:
-            a_ls.append(a[0, :])
+        a0 = lrf[0:3, :]
+        a1 = lrf[3:6, :]
+        a_ls.append(a0)
+        # TODO(mikexyl): should have many combinations
+        if a0 != a1:
+            a_ls.append(a0)
         return a_ls
 
     def extractFreetures(self, pointcloud):
