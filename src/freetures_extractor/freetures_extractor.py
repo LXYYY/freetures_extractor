@@ -30,6 +30,7 @@ class FreeturesExtractor(object):
         self.det_pc_pub = rospy.Publisher('det', PointCloud2)
         self.kp_pc_pub = rospy.Publisher('keypoints', PointCloud2)
         self.lrf_pub = rospy.Publisher('lrc', MarkerArray)
+        self.grad_gauss_sum = 0
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
         self.session = tf.Session(config=config)
@@ -38,31 +39,31 @@ class FreeturesExtractor(object):
 
     def _get_gaussian(self, sigma):
         x = np.arange(-2, 3, 1)
-        gaussian = tf.convert_to_tensor(np.exp(-(x)**2 / (2 * sigma**2)),
-                                        dtype=tf.float32)
+        g_kernel = np.exp(-(x)**2 / (2 * sigma**2))
+        gaussian = tf.convert_to_tensor(g_kernel, dtype=tf.float32)
         x_gaussian = gaussian[:, tf.newaxis, tf.newaxis, tf.newaxis,
                               tf.newaxis]
         y_gaussian = gaussian[tf.newaxis, :, tf.newaxis, tf.newaxis,
                               tf.newaxis]
         z_gaussian = gaussian[tf.newaxis, tf.newaxis, :, tf.newaxis,
                               tf.newaxis]
-        return x_gaussian, y_gaussian, z_gaussian
+        return [x_gaussian, y_gaussian, z_gaussian], np.sum(g_kernel)
 
-    def _gaussian(self, in_tensor, x_gauss, y_gauss, z_gauss):
+    def _gaussian(self, in_tensor, gaussian):
         pc_gauss_x = tf.nn.conv3d(in_tensor,
-                                  x_gauss,
+                                  gaussian[0],
                                   strides=[1, 1, 1, 1, 1],
                                   padding="SAME")
         pc_gauss_y = tf.nn.conv3d(in_tensor,
-                                  y_gauss,
+                                  gaussian[1],
                                   strides=[1, 1, 1, 1, 1],
                                   padding="SAME")
         pc_gauss_z = tf.nn.conv3d(in_tensor,
-                                  z_gauss,
+                                  gaussian[2],
                                   strides=[1, 1, 1, 1, 1],
                                   padding="SAME")
         pc_gauss_xyz = tf.math.add(tf.math.add(pc_gauss_x, pc_gauss_y),
-                                   pc_gauss_z)
+                                   pc_gauss_z) / 3
         return pc_gauss_xyz
 
     def _process(self):
@@ -74,15 +75,14 @@ class FreeturesExtractor(object):
             y_sobel = sobel[tf.newaxis, :, tf.newaxis, tf.newaxis, tf.newaxis]
             z_sobel = sobel[tf.newaxis, tf.newaxis, :, tf.newaxis, tf.newaxis]
 
-            x_grad_gauss, y_grad_gauss, z_grad_gauss = self._get_gaussian(
+            grad_gauss, self.grad_gauss_sum = self._get_gaussian(
                 2)  # sigma_grad
-            x_desc_gauss, y_desc_gauss, z_desc_gauss = self._get_gaussian(
-                self.param['r_frame'])  # sigma_grad
+            desc_gauss, _ = self._get_gaussian(
+                self.param['r_frame'])  # sigma_desc
 
             # compute det of hessian
             pc_in = tf.placeholder(dtype=tf.float32)
-            pc_gauss_xyz = self._gaussian(pc_in, x_grad_gauss, y_grad_gauss,
-                                          z_grad_gauss)
+            pc_gauss_xyz = self._gaussian(pc_in, grad_gauss)
 
             gx = tf.nn.conv3d(pc_gauss_xyz,
                               x_sobel,
@@ -156,12 +156,9 @@ class FreeturesExtractor(object):
                                   padding='SAME'), tf.bool)
             kp = tf.math.logical_and(tf.math.equal(det, local_max), non_zeros)
 
-            gx_gauss = self._gaussian(gx, x_desc_gauss, y_desc_gauss,
-                                      z_desc_gauss)
-            gy_gauss = self._gaussian(gy, y_desc_gauss, y_desc_gauss,
-                                      z_desc_gauss)
-            gz_gauss = self._gaussian(gz, z_desc_gauss, y_desc_gauss,
-                                      z_desc_gauss)
+            gx_gauss = self._gaussian(gx, desc_gauss)
+            gy_gauss = self._gaussian(gy, desc_gauss)
+            gz_gauss = self._gaussian(gz, desc_gauss)
 
             g_gauss = tf.stack([gx_gauss, gy_gauss, gz_gauss], axis=4)
 
@@ -193,12 +190,11 @@ class FreeturesExtractor(object):
                         feed_dict={pc_in: pc_in_numpy})
 
                     kp_ids = np.where(kp_np[0, :, :, :, 0] == 1)
-                    lrf = self._compute_lrf(s_omega_np[0, :, :, :, :, :],
-                                            g_gauss_np[0, :, :, :, :,
-                                                       0], kp_ids)
+                    self._compute_lrf(s_omega_np[0, :, :, :, :, :],
+                                      g_gauss_np[0, :, :, :, :, 0], kp_ids)
 
                     # rviz visualization
-                    self._publish_lrf_arrow(lrf, kp_ids)
+                    # self._publish_lrf_arrow(lrf, kp_ids)
                     self._publish_pointcloud(pc_in_numpy[0, :, :, :, :],
                                              self.dist_pc_pub, 'dist')
                     self._publish_pointcloud(det_np[0, :, :, :, :],
@@ -209,27 +205,34 @@ class FreeturesExtractor(object):
                     # det_np = np.array(det)
                     # kp_np = np.array(kp)
 
+    def __compute_gk(self, g, kp_id, shape=None):
+        i0 = kp_id[0] - self.r_frame
+        i1 = kp_id[0] + self.r_frame
+        j0 = kp_id[1] - self.r_frame
+        j1 = kp_id[1] + self.r_frame
+        k0 = kp_id[2] - self.r_frame
+        k1 = kp_id[2] + self.r_frame
+        if shape is not None:
+            if i0 < 0 or i1 > shape[0] or j0 < 0 or j1 > shape[
+                    1] or k0 < 0 or k1 > shape[2]:
+                return None
+        return g[i0:i1, j0:j1, k0:k1]
+
     def _compute_lrf(self, s_omega, g, kp_ids):  # np.array [i,j,k,c]
         if not kp_ids[0]:
             return
         shape = g.shape
         kp_a = np.empty(shape=(kp_ids[0].shape[0]) + (0, )).tolist()
+        eigen_value = []
         for i in range(len(kp_ids[0])):
             kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
-            _, v = np.linalg.eig(s_omega[kp_id[0], kp_id[1], kp_id[2]])
+            e_val, v = np.linalg.eig(s_omega[kp_id[0], kp_id[1], kp_id[2]])
             a = []
             for j in range(3):
                 # Equation 8
-                i0 = kp_id[0] - self.r_frame
-                i1 = kp_id[0] + self.r_frame
-                j0 = kp_id[1] - self.r_frame
-                j1 = kp_id[1] + self.r_frame
-                k0 = kp_id[2] - self.r_frame
-                k1 = kp_id[2] + self.r_frame
-                if i0 < 0 or i1 > shape[0] or j0 < 0 or j1 > shape[
-                        1] or k0 < 0 or k1 > shape[2]:
+                gk = self.__compute_gk(g, kp_id, shape)
+                if gk is None:
                     continue
-                gk = g[i0:i1, j0:j1, k0:k1]
                 # TODO(mikexyl): check dimension
                 gkvi = np.tensordot(gk, v[j], axes=(3, 0))
                 s = np.sum(gkvi)
@@ -239,15 +242,46 @@ class FreeturesExtractor(object):
                 k_axis = self.param['k_axis']
                 if s >= k_axis:
                     a.append(v[j])
-                    a.append(0)
+                    a.append(np.array([0, 0, 0]))
                 elif -k_axis <= s <= k_axis:
                     a.append(v[j])
                     a.append(-v[j])
                 else:
                     a.append(-v[j])
-                    a.append(0)
+                    a.append(np.array([0, 0, 0]))
+            if len(a) != 6:
+                continue
             kp_a[i] = a
-        return kp_a
+            eigen_value.append(e_val)
+        return kp_a, eigen_value
+
+    def _compute_descriptor(self, lrf, e_val, kp_ids, g, sdf):
+        for i in range(len(kp_ids[0])):
+            kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
+            # Equation 9
+            gk_s = self.__compute_gk(g, kp_id)
+            a_ls = self.__compute_two_lrf(lrf[i])
+            for a in a_ls:
+                # TODO(mikexyl): verify dimension
+                R_f_s = np.linalg.inv(np.stack(a))
+                gk_f = np.matmul(R_f_s * gk_s)
+
+                # Equation 10
+                # TODO(mikexyl): for now, just give up points having
+                #  invalid sdf in its desc support
+                b_dist = sdf[kp_id[0], kp_id[1],
+                             kp_id[2]] / self.grad_gauss_sum
+
+                # Equation 12
+                b_class = np.sum(e_val[i] > 0)
+
+                alp_dist = 1e-7
+                alp_class = 1e-5
+
+                d_dist = alp_dist * b_dist
+                d_class = alp_class * b_class
+
+                return d_class, d_dist, gk_f, e_val, lrf
 
     def _publish_pointcloud(self, pc_np, publisher, data_type):
         assert len(pc_np.shape) == 4
@@ -319,33 +353,38 @@ class FreeturesExtractor(object):
         marker.action = Marker.ADD
         return marker
 
-    def _publish_lrf_arrow(self, lrf, kp_ids):
-        reset_marker = self.__new_marker()
-        reset_marker.action = Marker.DELETEALL
-        self.lrf_pub.publish(reset_marker)
-        assert len(lrf) == len(kp_ids[0])
-        marker_array = MarkerArray()
-        for i in range(len(kp_ids)):
-            x = kp_ids[0][i] * self.vis_scale
-            y = kp_ids[1][i] * self.vis_scale
-            z = kp_ids[2][i] * self.vis_scale
-            a = np.zeros((2, 3))
-            for j in range(3):
-                for k in range(2):
-                    if lrf[i][j * 2 + k] > 0:
-                        a[k][j] = lrf[i][j * 2 + k]
-            assert (a[0, :] != 0).all()
-            marker = self.__new_marker()
-            marker.points.append(np.array([x, y, z]))
-            marker.points.append(np.array([x, y, z] + a[0, :]))
-            marker_array.markers.append(marker)
-            if (a[1, :] != 0).any():
-                for l in range(3):
-                    if (a[1, l] != 0):
-                        a[0, l] = a[1, l]
-                marker.points[1] = np.array([x, y, z] + a[0, :])
-                marker_array.markers.append(marker)
-        self.lrf_pub.publish(marker_array)
+    # def _publish_lrf_arrow(self, lrf, kp_ids):
+    #     reset_marker = self.__new_marker()
+    #     reset_marker.action = Marker.DELETEALL
+    #     self.lrf_pub.publish(reset_marker)
+    #     assert len(lrf) == len(kp_ids[0])
+    #     marker_array = MarkerArray()
+    #     for i in range(len(kp_ids)):
+    #         x = kp_ids[0][i] * self.vis_scale
+    #         y = kp_ids[1][i] * self.vis_scale
+    #         z = kp_ids[2][i] * self.vis_scale
+    #         a_ls=self.__compute_two_lrf(lrf[i])
+    #         for a in a_ls:
+    #             marker = self.__new_marker()
+    #             marker.points.append(np.array([x, y, z]))
+    #             marker.points.append(np.array([x, y, z] + a))
+    #             marker_array.markers.append(marker)
+    #     self.lrf_pub.publish(marker_array)
+
+    def __compute_two_lrf(self, lrf):
+        a = np.zeros((2, 3, 3))
+        a_ls = []
+        for j in range(3):
+            for k in range(2):
+                if (lrf[j * 2 + k] != 0).any():
+                    a[k, j, :] = lrf[j * 2 + k]
+        a_ls.append(a[0, :, :])
+        for l in range(3):
+            if (a[1, l, :] != 0).any():
+                a[0, l, :] = a[1, l, :]
+        if a[0, :, :] != a_ls[0]:
+            a_ls.append(a[0, :])
+        return a_ls
 
     def extractFreetures(self, pointcloud):
         i_max = np.max(pointcloud['gi'])
