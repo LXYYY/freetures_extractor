@@ -3,6 +3,8 @@ import threading
 import struct
 import Queue
 import rospy
+from math import pi
+from datetime import timedelta
 import numpy as np
 from std_msgs.msg import Header
 from sensor_msgs import point_cloud2
@@ -10,6 +12,9 @@ from sensor_msgs.msg import PointCloud2, PointField
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 import tensorflow as tf
+from timeit import default_timer as timer
+
+from . import matcher
 
 
 class FreeturesExtractor(object):
@@ -27,6 +32,16 @@ class FreeturesExtractor(object):
                 f.write("{}\n".format(subwords))
         self.r_frame = param['r_frame']
         self.vis_scale = param['vis_scale']
+        self.ang_res = float(pi / param['n_div'])
+        self.n_divs = int(param['n_div'])
+        self.matcher = matcher.Matcher(param)
+        self.submap_dict = {}
+        assert self.n_divs // 2 != 0  # make life easier
+        self.n_dims = 2 * self.n_divs**2
+        self.solid_angle = self.__compute_solid_angle(
+            np.concatenate(
+                (np.arange(self.n_divs), np.arange(-self.n_divs,
+                                                   0))).repeat(self.n_divs))
         self.dist_pc_pub = rospy.Publisher('distance', PointCloud2)
         self.det_pc_pub = rospy.Publisher('det', PointCloud2)
         self.kp_pc_pub = rospy.Publisher('keypoints', PointCloud2)
@@ -145,8 +160,8 @@ class FreeturesExtractor(object):
                 self.param['r_local_max'], self.param['r_local_max'],
                 self.param['r_local_max']
             ],
-                                         strides=1,
-                                         padding='SAME')
+                strides=1,
+                padding='SAME')
             non_zeros = tf.cast(tf.math.not_equal(pc_in, tf.constant(0.0)),
                                 tf.float32)
             non_zeros = tf.cast(
@@ -154,8 +169,8 @@ class FreeturesExtractor(object):
                     self.param['r_frame'], self.param['r_frame'],
                     self.param['r_frame']
                 ],
-                                  strides=1,
-                                  padding='SAME'), tf.bool)
+                    strides=1,
+                    padding='SAME'), tf.bool)
             kp = tf.math.logical_and(tf.math.equal(det, local_max), non_zeros)
 
             gx_gauss = self._gaussian(gx, desc_gauss)
@@ -184,20 +199,38 @@ class FreeturesExtractor(object):
 
             with self.session.as_default():
                 while True:
-                    pc_in_numpy = self.esdf_queue.get(True)
+                    pc_in_numpy, frame = self.esdf_queue.get(True)
+                    start_timer = timer()
                     print('processed esdf point cloud size')
                     print(np.multiply.accumulate(pc_in_numpy.shape))
                     det_np, kp_np, g_gauss_np, s_omega_np = self.session.run(
                         [det, kp, g_gauss, s_omega],
                         feed_dict={pc_in: pc_in_numpy})
+                    end_timer = timer()
+                    print(timedelta(seconds=(end_timer - start_timer)))
 
                     kp_ids = np.where(kp_np[0, :, :, :, 0] == 1)
                     s_omega_rdc = s_omega_np[0, :, :, :, :, :]
                     g_gauss_rdc = g_gauss_np[0, :, :, :, :, 0]
-                    self._compute_lrf(s_omega_rdc, g_gauss_rdc, kp_ids)
-                    self._publish_gradient_arrow(g_gauss_rdc, kp_ids)
+                    sdf_rdc = pc_in_numpy[0, :, :, :, :]
+                    lrf, eigen_val = self._compute_lrf(s_omega_rdc,
+                                                       g_gauss_rdc, kp_ids)
+                    if lrf is not None:
+                        kp_dup, descriptors = self._compute_descriptor(
+                            lrf, eigen_val, kp_ids, g_gauss_rdc, sdf_rdc)
+                        if len(self.submap_dict) > 0:
+                            for frame in self.submap_dict:
+                                result=self.matcher.compute_registration(
+                                    kp_dup, self.submap_dict[frame][0],
+                                    descriptors, self.submap_dict[frame][1])
+                                print(result.fitness)
+                        self.submap_dict[frame] = (kp_dup, descriptors)
+
+                    end_timer = timer()
+                    print(timedelta(seconds=(end_timer - start_timer)))
 
                     # rviz visualization
+                    self._publish_gradient_arrow(g_gauss_rdc, kp_ids)
                     # self._publish_lrf_arrow(lrf, kp_ids)
                     self._publish_pointcloud(pc_in_numpy[0, :, :, :, :],
                                              self.dist_pc_pub, 'dist')
@@ -223,8 +256,8 @@ class FreeturesExtractor(object):
         return g[i0:i1, j0:j1, k0:k1]
 
     def _compute_lrf(self, s_omega, g, kp_ids):  # np.array [i,j,k,c]
-        if len(kp_ids[0]):
-            return
+        if len(kp_ids[0]) == 0:
+            return None, None
         shape = g.shape
         kp_a = np.zeros(shape=(kp_ids[0].shape[0], 6, 3))
         eigen_value = []
@@ -256,33 +289,112 @@ class FreeturesExtractor(object):
             eigen_value.append(e_val)
         return kp_a, eigen_value
 
+    def __compute_azi_pol_mag(self, p):
+        mag = np.linalg.norm(p, axis=3)
+        azi = np.arctan2(p[:, :, :, 1], p[:, :, :, 0])
+        pol = np.arctan2(p[:, :, :, 2],
+                         np.linalg.norm([p[:, :, :, 0], p[:, :, :, 1]]))
+        return azi, pol, mag
+
+    def __compute_bin_id(self, azi, pol):
+        azi_id, azi_mod = divmod(azi, self.ang_res)
+        pol_id, pol_mod = divmod(pol, self.ang_res)
+        return azi_id, azi_mod, pol_id, pol_mod
+
+    def __desc_soft_binning(self, azi_id, azi_mod, pol_id, pol_mod, mag):
+        # TODO(mikexyl): this can be more vectorized
+        n_dim = [
+            azi_id.shape[0] * azi_id.shape[1] * azi_id.shape[2], self.n_dims
+        ]
+
+        new_descriptor = np.zeros(n_dim)
+        # bilinear interpolation
+        desc_id = np.zeros([n_dim[0], 2])
+        desc_id[:, 1] = np.reshape(azi_id * self.n_divs + pol_id, (n_dim[0]))
+        desc_id[:, 0] = range(n_dim[0])
+        desc_id = desc_id.astype(np.int).T.tolist()
+        new_descriptor[desc_id] = new_descriptor[desc_id] + (
+            mag * (self.ang_res - azi_mod) / self.ang_res *
+            (self.ang_res - pol_mod) / self.ang_res).reshape(n_dim[0])
+
+        desc_id = np.zeros([n_dim[0], 2])
+        desc_id[:, 1] = ((azi_id + 1) * self.n_divs + pol_id).reshape(n_dim[0])
+        desc_id[:, 0] = range(n_dim[0])
+        desc_id = desc_id.astype(np.int).T.tolist()
+        new_descriptor[desc_id] = new_descriptor[desc_id] + (
+            mag * azi_mod / self.ang_res *
+            (self.ang_res - pol_mod) / self.ang_res).reshape(n_dim[0])
+
+        desc_id = np.zeros([n_dim[0], 2])
+        desc_id[:,
+                1] = ((azi_id * self.n_divs + (pol_id + 1))).reshape(n_dim[0])
+        desc_id[:, 0] = range(n_dim[0])
+        desc_id = desc_id.astype(np.int).T.tolist()
+        new_descriptor[desc_id] = new_descriptor[desc_id] + (
+            mag * (self.ang_res - azi_mod) / self.ang_res * pol_mod /
+            self.ang_res).reshape(n_dim[0])
+
+        desc_id = np.zeros([n_dim[0], 2])
+        desc_id[:, 1] = ((azi_id + 1) * self.n_divs + (pol_id + 1)).reshape(
+            (n_dim[0]))
+        desc_id[:, 0] = range(n_dim[0])
+        desc_id = desc_id.astype(np.int).T.tolist()
+        new_descriptor[desc_id] = new_descriptor[desc_id] + (
+            mag * azi_mod / self.ang_res * pol_mod / self.ang_res).reshape(
+                n_dim[0])
+        return np.sum(new_descriptor, axis=0)
+
+    def __compute_solid_angle(self, azi_id):
+        azi = azi_id * self.ang_res
+        return self.ang_res * (np.cos(azi) - np.cos(azi + self.ang_res))
+
+    def __normalize_desc(self, descriptor, n_voxels):
+        descriptor = descriptor / (n_voxels * self.solid_angle)
+        return descriptor
+
     def _compute_descriptor(self, lrf, e_val, kp_ids, g, sdf):
+        descriptors = None
+        kp_dup = None
         for i in range(len(kp_ids[0])):
             kp_id = [kp_ids[0][i], kp_ids[1][i], kp_ids[2][i]]
             # Equation 9
             gk_s = self.__compute_gk(g, kp_id)
-            a_ls = self.__compute_two_lrf(lrf[i])
+            a_ls = self.__compute_axes(lrf[i])
             for a in a_ls:
                 # TODO(mikexyl): verify dimension
-                R_f_s = np.linalg.inv(np.stack(a))
-                gk_f = np.matmul(R_f_s * gk_s)
+                R_f_s = np.linalg.inv(np.transpose(a))
+                # TODO(mikexyl): there should a np function for this
+                gk_f = np.matmul(R_f_s, gk_s[:, :, :, :, np.newaxis])
+                azi, pol, mag = self.__compute_azi_pol_mag(gk_f)
+                azi_id, azi_mod, pol_id, pol_mod = self.__compute_bin_id(
+                    azi, pol)
+
+                descriptor = self.__desc_soft_binning(azi_id, azi_mod, pol_id,
+                                                      pol_mod, mag)
+                # Normalize descriptors
+                # TODO(mikexyl): count n of valid voxels
+                descriptor = self.__normalize_desc(descriptor, self.r_frame**2)
 
                 # Equation 10
                 # TODO(mikexyl): for now, just give up points having
                 #  invalid sdf in its desc support
                 b_dist = sdf[kp_id[0], kp_id[1],
                              kp_id[2]] / self.grad_gauss_sum
-
                 # Equation 12
                 b_class = np.sum(e_val[i] > 0)
-
                 alp_dist = 1e-7
                 alp_class = 1e-5
-
                 d_dist = alp_dist * b_dist
                 d_class = alp_class * b_class
+                descriptor = np.concatenate((descriptor, [d_dist, d_class]))
 
-                return d_class, d_dist, gk_f, e_val, lrf
+                if kp_dup is None and descriptors is None:
+                    kp_dup = np.array(kp_id)
+                    descriptors = descriptor
+                else:
+                    kp_dup = np.vstack([kp_dup, np.array(kp_id)])
+                    descriptors = np.vstack([descriptors, descriptor])
+        return kp_dup, descriptors.astype(np.float)
 
     def _publish_pointcloud(self, pc_np, publisher, data_type):
         assert len(pc_np.shape) == 4
@@ -361,24 +473,6 @@ class FreeturesExtractor(object):
         marker.color.a = 255
         return marker
 
-    # def _publish_lrf_arrow(self, lrf, kp_ids):
-    #     reset_marker = self.__new_marker()
-    #     reset_marker.action = Marker.DELETEALL
-    #     self.lrf_pub.publish(reset_marker)
-    #     assert len(lrf) == len(kp_ids[0])
-    #     marker_array = MarkerArray()
-    #     for i in range(len(kp_ids)):
-    #         x = kp_ids[0][i] * self.vis_scale
-    #         y = kp_ids[1][i] * self.vis_scale
-    #         z = kp_ids[2][i] * self.vis_scale
-    #         a_ls=self.__compute_two_lrf(lrf[i])
-    #         for a in a_ls:
-    #             marker = self.__new_marker()
-    #             marker.points.append(np.array([x, y, z]))
-    #             marker.points.append(np.array([x, y, z] + a))
-    #             marker_array.markers.append(marker)
-    #     self.lrf_pub.publish(marker_array)
-
     def _publish_gradient_arrow(self, g, kp_ids):
         if len(kp_ids[0]) == 0:
             return
@@ -401,28 +495,32 @@ class FreeturesExtractor(object):
             grad_markers.markers.append(grad_marker)
         self.grad_pub.publish(grad_markers)
 
-    def __compute_two_lrf(self, lrf):
+    def __compute_axes(self, lrf):  # return [v1,v1,v1;v2,v2,v2;v3,v3,v3]
         a = np.zeros((2, 3, 3))
         a_ls = []
-        a0 = lrf[0:3, :]
-        a1 = lrf[3:6, :]
-        a_ls.append(a0)
-        # TODO(mikexyl): should have many combinations
-        if a0 != a1:
-            a_ls.append(a0)
+        a = [[], [], []]
+        for i in range(3):
+            a[i].append(lrf[i, :])
+            if (a[i][0] != lrf[i + 3, :]).any():
+                a[i].append(lrf[i + 3, :])
+        for i in range(len(a[0])):
+            for j in range(len(a[1])):
+                for k in range(len(a[2])):
+                    a_ls.append(np.stack((a[0][i], a[1][j], a[2][k])))
         return a_ls
 
-    def extractFreetures(self, pointcloud):
+    def extractFreetures(self, pointcloud, frame):
         i_max = np.max(pointcloud['gi'])
         i_min = np.min(pointcloud['gi'])
         j_max = np.max(pointcloud['gj'])
         j_min = np.min(pointcloud['gj'])
         k_max = np.max(pointcloud['gk'])
         k_min = np.min(pointcloud['gk'])
+        print('received point cloud size:', len(pointcloud['gi']))
         pc = np.zeros(
             (1, i_max - i_min + 1, j_max - j_min + 1, k_max - k_min + 1, 1),
             dtype=np.float32)
         for i, j, k, dist in zip(pointcloud['gi'], pointcloud['gj'],
                                  pointcloud['gk'], pointcloud['distance']):
             pc[0, i - i_min, j - j_min, k - k_min] = dist
-        self.esdf_queue.put(pc)
+        self.esdf_queue.put((pc, frame))

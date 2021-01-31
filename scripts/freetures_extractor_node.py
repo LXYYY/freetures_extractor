@@ -11,14 +11,16 @@ class EsdfPointcloudSub(object):
     def __init__(self):
         self.parameters = rospy.get_param("~")
         self.extractor = FreeturesExtractor(self.parameters)
-        self.pc_sub = rospy.Subscriber(
-            "esdf_pointcloud2", PointCloud2, callback=self.callback)
+        self.pc_sub = rospy.Subscriber("esdf_pointcloud2",
+                                       PointCloud2,
+                                       callback=self.callback)
 
     def callback(self, pointcloud_msg):
-        if len(pointcloud_msg.data)==0:
+        if len(pointcloud_msg.data) == 0:
             return
         pc_numpy = ros_numpy.numpify(pointcloud_msg)
-        self.extractor.extractFreetures(pc_numpy)
+        self.extractor.extractFreetures(pc_numpy,
+                                        pointcloud_msg.header.frame_id)
 
 
 if __name__ == '__main__':
